@@ -1,0 +1,2035 @@
+---
+title: "Spatial trend analysis with Generalized Ridge GAM"
+author: "Javier Roca and Celestino Ordóñez"
+date: "2026-04-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(mgcv)
+library(gstat)
+library(sp)
+library(automap)
+library(geodist)
+library(spdep)
+library(scatterplot3d)
+library(sf)
+library(units)
+library(rgl)
+library(ggplot2)
+library(MASS)
+library(microbenchmark)
+library(RANN)
+library(Matrix)
+```
+
+Define the type of distance, the scenario for the simulated data (1 uniform covariance, 2 non-uniform covariance), the maximum distance between points to be considered and the number of neighbors to be used.
+```{r}
+metric <- readline(prompt = "Write the type of distance (Euclidean or geodetic): ")
+scenario <- as.integer(readline(prompt = "Write the number of the scenario to be simulted: "))
+range <- as.integer(readline(prompt = "Write the maximum distance between points for the analysis: "))
+spam <- as.integer(readline(prompt = "Write the number of neighbors to be considered: "))
+n <- as.integer(readline(prompt = "Write the number of observations: "))
+```
+
+Function to fit a Generalized ridge GAM model
+INPUTS:
+- model: a previous ridge GAM model to be generalized
+- w: weights matrix for smoothing
+- data: dataframe containing the variables
+OUTPUT:
+- model: generalized ridge GAM
+```{r}
+gam.magic=function(model, w, data){
+ G <- gam(formula(model), fit=FALSE, data=data)
+ mgfit <- magic(G$y, G$X, G$sp, G$S, G$off, rank=G$rank, C=G$C, w=w)
+ mg.stuff <- magic.post.proc(G$X, mgfit, w)
+ model$edf <- mg.stuff$edf
+ model$Vp <- mg.stuff$Vb
+ model$coefficients <- mgfit$b 
+ model
+}
+```
+
+This function ensures the covariance matrix (Sigma) is positive definite.
+INPUT:
+- Sigma: the estimated covariance matrix
+OUTPUT:
+- Sigma: a numerically stable, positive definite version of the input matrix
+```{r}
+adjust.Sigma=function(Sigma) {
+# https://rubenfcasal.github.io/simbook/fact-cov.html
+  tol = 1e-06
+  es=eigen(Sigma, symmetric = TRUE)
+  ev=es$values  # Sigma eigenvalues
+  H=es$vectors # Sigma eigenvectors
+  problema=(!all(ev >= -tol * abs(ev)))  # return TRUE if at least there is an eigenvalue less than tol
+  
+  if (problema) {
+   ev[ev<tol]=tol  # 
+   Sigma=H%*%diag(ev)%*%t(H)  # Sigma is reconstructed using spectral decomposition S = H * diag(V) * t(h)
+  }
+  Sigma
+}
+```
+Function to generate a GAM model with nearest neighbors distance dependent coefficients. The output is a matrix with all the data
+INPUT: 
+ - s: dataset with the coordinates of the points
+ - y: dependet variable
+ - dist: distance matrix between each pair of points
+ - spam = number of nearest neighbors to be consider
+ OUTPUT:
+ - model: GAM model
+ - data: dataframe which column contains the following information: point indices, residual, distance between points and coordinates of the points
+```{r}
+ModelErrors=function(s, y, dist, spam=5) {
+  data2=NULL
+  n=nrow(s)
+  if (is.matrix(dist) == "FALSE") {dist<-as.matrix(dist)}
+  for (i0 in 1:n) {
+  ii=order(dist[,i0]) [2:(1+spam)]
+  data2=rbind(data2, c(dist[ii,i0], y[ii], y[i0],s[i0,1],s[i0,2]))}
+
+  data2=data.frame(data2)
+  names(data2)=c(paste0("dist",1:spam), paste0("y",1:spam), "y","s1","s2")
+  
+  formula=NULL
+  for (j in 1:spam) formula[j]=paste0("s(","dist",j,",by=y",j,")")
+  
+  formula=paste(formula,collapse="+")
+  formula=reformulate(formula, response ="y")
+  model=gam(formula=formula, data=data2)
+  
+  list(model=model, data=data2)
+}
+```
+Function to generate smoothing parameters when the distance is Euclidean
+INPUTS:
+- s: spatial coordinates
+- y: output variable
+- range: maximum distance to do the calculations
+OUTPUT: a list with the data (columns are i,j,s1,s2,dist,y_i,y_j) and a set of smoothing parameters
+
+```{r}
+if (metric == "Euclidean"){
+var.model_euclidean = function(s, y, dmat, range=range){
+    dist <- as.matrix(dmat)
+    data=NULL
+    n=length(y)
+    for (i in 1:n){
+      ii=which(dist[i,]<range & dist[i,]>=0)
+      naux=length(ii)
+      aux=cbind(rep(i,naux),ii,rep(s[i,1],naux),rep(s[i,2],naux),dist[i,ii],
+                rep(y[i],naux),y[ii])
+    data=rbind(data,aux)
+  }
+
+  dataf=data.frame(data)
+  names(dataf)=c("i","j","s1","s2","dist","y1","y2")
+  dataf=subset(dataf, i<=j)
+
+  data3=dataf[,c("dist","y1","y2")]
+
+  k=20 # number of baselines
+  unc <- gam(y2 ~ s(dist,k=k, bs = "cr", by=y1), data = data3)  # model y2 ~dis(y1,y2)*y1
+  sm <- smoothCon(s(dist, k=k, bs = "cr", by=y1), data=data3, knots = NULL)[[1]]
+  F <- mono.con(sm$xp, up = FALSE)
+  G <- list(X = sm$X, C = matrix(0,0,0), sp = unc$sp,
+            p = -sm$xp, y = data3$y2, w =rep(1,nrow(data3)) )
+
+
+  G$Ain <- F$A    # the monotonicity constraint matrix
+  G$bin <- F$b    # the monotonicity constraint vector, both from mono.con
+  G$S <- sm$S     # the penalty matrix for the cubic spline
+  G$off <- 0      # location of offsets in the penalty matrix
+  p <- pcls(G)  # fit spline (using s.p. from unconstrained fit)
+
+
+  list(data=dataf,sm=sm,p=p)
+}
+}
+```
+
+```{r}
+if (metric == 'geodetic') {
+geo_distance_matrix <- function(n, radius = 6371) {
+
+  u <- runif(n, cos(pi/6), cos(pi/8))  # change if needed
+  theta <- runif(n, 0, cos(pi/20)) # change if needed
+  phi <- acos(u)
+  
+  lat <- 90 - phi * 180/pi
+  lon <- -(theta * 180/pi - 180)
+  
+  pt_geo <- data.frame(lon=lon, lat=lat)
+  
+  x <- sin(phi) * cos(theta)
+  y <- sin(phi) * sin(theta)
+  z <- cos(phi)
+  
+  points_df <- data.frame(lon=lon, lat=lat, x=x, y=y, z=z)
+  
+  # Generate a sf object win an specific geograpahic CRS
+  points_sf <- st_as_sf(points_df,
+                        coords = c("lon", "lat"),
+                        crs = 4326)  # WGS84
+  
+  # Compute the distance matrix
+  dist_matrix <- st_distance(points_sf)   
+  
+  # Adjust the radius if it is necessary
+  dist_matrix <- dist_matrix * (radius / 6371)
+  
+  return(list(dist_matrix = dist_matrix, points = points_df, points_geo = pt_geo))
+}}
+```
+Generate points on the ellipsoid and compute the matrix of geometric distances 
+
+```{r}
+if (metric == "geodetic"){
+  set.seed(123)
+  R <- 6371
+  result <- geo_distance_matrix(n)
+  # Scale unit coordinates to the actual Earth radius
+  x <- R * result$points$x
+  y <- R * result$points$y
+  z <- R * result$points$z
+  # 3D visualization using rgl
+  plot3d(x, y, z, col="blue", size=5, xlim=c(-R, R), ylim=c(-R, R), zlim=c(-R, R),aspect=c(1,1,1))
+  # Add a wireframe sphere to represent the Earth's surface
+  spheres3d(0,0,0,radius=R, alpha=0.5, color="black", front="lines", back="lines", box=FALSE)
+}
+```
+
+Run this chunk only if you want to generate a .png file representing the points on the surface of a sphere
+```{r}
+# run_chunk <- FALSE
+# if (run_chunk) {
+#   if (metric=="geodetic"){
+#   x <- result$points$x
+#   y <- result$points$y
+#   z <- result$points$z
+#   R <- 6371
+#   # Initialize a new rgl window for offline rendering
+#   open3d()
+#   par3d(windowRect = c(0, 0, 900, 900)) # Set fixed resolution (900x900 px)
+#   bg3d("white")  # Set background color to white
+#   # Setup the 3D scene without axes or bounding boxes
+#   plot3d(0, 0, 0,
+#          xlim=c(-R, R),
+#          ylim=c(-R, R),
+#          zlim=c(-R, R),
+#          type="n",   # Plot nothing initially
+#          aspect=c(1,1,1),  # Maintain spherical proportions
+#          axes = FALSE,   
+#          box = FALSE) 
+#   # Draw the globe as a wireframe (lightgray lines)
+#   spheres3d(0, 0, 0, radius=R, alpha=0.5, color='lightgray', front='lines', back='lines')
+#   # Add the simulated blue points on the surface
+#   points3d(R*x, R*y, R*z, col="blue", size=5)
+#   # Remove any remaining bounding box artifacts and set initial view angle
+#   clear3d(type = "bbox")
+#   view3d(theta = 0, phi = 0)
+#   # Capture the current view and save it as a PNG file
+#   rgl.snapshot("sphere.png")
+#   # Close the RGL device to free up memory
+#   close3d()
+#   }
+# }
+```
+Function to create smoothing parameters when the distance is geodetic. The difference with var.model_euclidean is mainly in the type of splines. The dependence is bivariate instead of univariate
+
+```{r}
+if (metric == 'geodetic'){
+var.model_geodetic=function(s, y, dmat, range=range){
+    data=NULL
+    n=length(y)
+    # Create a pairwise dataset of points within the specified 'range'
+    for (i in 1:n){
+      ii=which(dmat[i,]<range & dmat[i,]>=0)
+      naux=length(ii)
+      aux=cbind(rep(i,naux),ii,rep(s[i,1],naux),rep(s[i,2],naux),dmat[i,ii],
+                rep(y[i],naux),y[ii])
+    data=rbind(data,aux)
+  }
+
+  data=data.frame(data)
+  names(data)=c("i","j","s1","s2","dist","y1","y2")
+  data=subset(data, i<=j)
+
+  data3=data[,c("dist","y1","y2")]
+  # Initial unconstrained GAM fit to get starting smoothing parameters
+  k = 20
+  unc <- gam(y2 ~ s(dist, bs = "cr", by = y1, k = k), data = data3)
+  sm <- smoothCon(s(dist, bs = "cr", by = y1, k = k), data = data3, knots = NULL)[[1]]
+  print(length(sm$xp))
+  F <- mono.con(sm$xp, up = FALSE)   
+  G <- list(X = sm$X, C = matrix(0,0,0), sp = unc$sp,
+            p = -sm$xp, y = data3$y2, w =rep(1,nrow(data3)) )
+
+  G$Ain <- F$A    # the monotonicity constraint matrix
+  G$bin <- F$b    # the monotonicity constraint vector, both from mono.con
+  G$S <- sm$S     # the penalty matrix for the cubic spline
+  G$off <- 0      # location of offsets in the penalty matrix
+  p <- pcls(G)  # fit spline (using s.p. from unconstrained fit)
+  
+  
+  list(data=data,sm=sm,p=p)
+}}
+```
+Data simulation
+This function generates a covariance matrix depending on the distance.
+Later, the errors with this covariance are simulated
+Finally it generates a variable y = trend + errors
+INPUTS: 
+- dist: distance matrix
+- rho: parameter to modify the covariance
+
+```{r}
+true.cov=function(dist, rho) {exp(-dist/rho)}  # theoretical covariance
+rho <- 20 # correlation range parameter: increase rho to increase the covariance
+sig=1.5  # standard deviation of the Gaussian distribution to generate errors
+
+if (metric == 'Euclidean'){
+  # Generate random coordinates in a 100x100 square
+    s <- cbind(s1=runif(n,0,100),s2=runif(n,0,100))
+    dmat <- dist(s)
+    # Call the function to create build the covariance matrix
+    V <- true.cov(dmat, rho)
+    V <- adjust.Sigma(V) # Ensure the matrix is positive-definite
+    Cv <- chol(V)     # Cholesky decomposition for error simulation
+
+    } else if (metric=="geodetic") {
+      result <- geo_distance_matrix(n,6371)
+      dmatrix <- result$dist_matrix
+      rho <- rho/100
+      dmat <- drop_units(dmatrix) # distance in m
+      V <- true.cov(dmat, rho)
+      V <- adjust.Sigma(V)
+      Cv <- chol(V) 
+} else {
+  stop("metric must be either 'Euclidean' or 'geodetic'")
+}
+
+# Scenario 2: Non-uniform spatial covariance (Heterogeneous structure). We only consider the Euclidean approach, but it could be also valid for the geodetic case
+if (metric=="Euclidean" && scenario == 2){
+  V1 <- V
+  rho1 <- 150
+  for (i in 151:300) {  # here n should be 300
+    for (j in 151:300){
+      dmatrix <- as.matrix(dmat)
+      d <- dmatrix[i,j]
+      v <- 2*true.cov(d, rho1)
+      V1[i,j]=v
+    }
+  }
+
+  diag(V1) <- diag(V1) + 1e-6
+
+  V2 <- adjust.Sigma(V1)
+
+  Cv <- chol(V2)  # t(Cv)%*%Cv=V
+
+  }  #  end if for scenario 2
+
+
+# Response variable generation (f + e)
+if (metric=="Euclidean"){
+  w <- solve(t(Cv))  ## Inverse of Cholesky factor as weights
+  e <- t(Cv) %*% rnorm(n, 0, sig) # so cov(e) = V * sig^2 ; These are the simulated errors 
+# Trend
+  f1=5*sin(8*s[,1]/100)  
+  f2=3*(s[,2]/100)
+  # f2=6*sin(8*s[,2]/100)
+  f=f1+f2
+  e <- t(Cv) %*% rnorm(n, 0, sig) # so cov(e) = V * sig^2 ; These are the spatially correlated errors
+
+  y <- f + e 
+
+}
+
+if (metric=="geodetic"){
+      w <- solve(t(Cv)) 
+      e <- mvrnorm(1, mu = rep(0, n), Sigma = sig^2 * Cv)
+      result <- geo_distance_matrix(n,6371)
+      points_geo <- result$points_geo
+      lon <- points_geo$lon
+      lat <- points_geo$lat
+
+  #  trend
+    lon_rad <- lon * pi/180
+    lat_rad <- lat * pi/180
+    f <- 15*sin(8*lon_rad) + 8*lat_rad
+    
+    y <- f+e
+}
+```
+Function to calculate the distance matrix given a threshold for the distances and using k-nearest neighbors algorithm
+
+```{r}
+#library(RANN)
+library(Matrix)
+library(dbscan)
+
+# dmatrix_dbscan <- function(points, d0 = 80) {
+# 
+# nn <- frNN(points, eps = d0)
+# 
+# n <- nrow(points)
+# 
+# i_list <- vector("list", n)
+# j_list <- vector("list", n)
+# h_list <- vector("list", n)
+# 
+# for (i in 1:n) {
+#   j <- nn$id[[i]]
+# 
+#   if (length(j) > 0) {
+#     si <- matrix(points[i, ], nrow = length(j), ncol = ncol(points), byrow = TRUE)
+#     sj <- points[j, , drop = FALSE]
+#     h <- sqrt(rowSums((si - sj)^2))
+# 
+#     i_list[[i]] <- rep(i, length(j))
+#     j_list[[i]] <- j
+#     h_list[[i]] <- h
+#   }
+# }
+# 
+# i <- unlist(i_list)
+# j <- unlist(j_list)
+# h <- unlist(h_list)
+# 
+# D_sparse <- sparseMatrix(i = i, j = j, x = h)
+# D_sparse <- (D_sparse + t(D_sparse)) / 2
+# }
+# 
+# # d0 = 80
+# # distmatrix <- dmatrix_dbscan(s, d0)
+# # V <- true.cov(distmatrix, rho)
+# # V <- adjust.Sigma(V) # Ensure the matrix is positive-definite
+# # Cv <- chol(V)   # Cholesky decomposition for error simulation
+# d0 = 40
+# res<-microbenchmark(
+#       {
+#     distmatrix <- dmatrix_dbscan(s, d0)
+#     V <- true.cov(distmatrix, rho)
+#     V <- adjust.Sigma(V) # Ensure the matrix is positive-definite
+#     Cv <- chol(V)
+#     },# Cholesky decomposition for error simulation
+#     times = 100)
+#     summary_res <- summary(res)
+#     median_time <- summary_res$median
+#     cat("Elapsed time:", median_time, "nanoseconds\n")
+```
+
+Initial visualization of the deterministic trend (f) vs the noisy response (y)
+```{r}
+if (metric=="Euclidean"){
+  par(mfrow=c(1,2))
+  s1 <- s[,1]
+  s2 <- s[,2]
+  ii <- order(s1)
+  jj <- order(s2)
+  # Plot components of the Euclidean trend
+  plot(s1[ii], f1[ii], type="l", main = "Trend f1 (X axis)")
+  plot(s2[jj], f2[jj], type="l", main = "Trend f2 (Y axis)")
+} else {
+  ii <- order(lon)
+  lon_ordered <- lon[ii]
+  par(mfrow=c(1,2))
+  plot(lon_ordered, f[ii], type="l", main = "True Trend (f)", xlab = "Longitude")
+  plot(lon_ordered, y[ii], type="l", main = "Observed Response (y)", xlab = "Longitude")
+  abline(h=0, lty=3)
+}
+```
+
+Plot errors over points
+```{r}
+# library(ggplot2)
+# datos_plot <- data.frame(s1 = s[,1], s2 = s[,2], error = e)
+# 
+# ggplot(datos_plot, aes(x = s1, y = s2, color = error)) +
+#   geom_point() +
+#   scale_color_gradient2(low = "blue", mid = "white", high = "red",
+#                         midpoint = 0) +
+#   labs(title = "Simulated error for each point",
+#        color = "Error") +
+#   theme_minimal()
+```
+Estimate the covariance of the residuals based on the distance matrix
+
+```{r}
+if (metric=="geodetic"){
+  # Fit the geodetic variance model using the simulated errors 'e'
+  A=var.model_geodetic(points_geo, e, dmat, range=range)
+  values=seq(0,range-1000, 15000) # change in needed
+  newdata=data.frame(dist=values)
+  pred=Predict.matrix(A$sm, newdata) %*% A$p
+  new0 = data.frame(dist=0)
+  pred0 = Predict.matrix(A$sm, new0) %*% A$p
+  pred0 <- pmax(pred0, 0)  # Non-negativity constraint
+  pred = pred/as.vector(pred0)
+  pred <- pmax(pred, 0) # Ensure covariance values are non-negative
+  # Plot estimated covariance (black) vs. theoretical covariance (red)
+  plot(values,pred,xlab='Distance (m)', ylab='Covariance', ylim=range(0,1), main = "Covariance Estimation (Geodetic)")
+  lines(values,true.cov(values, rho), col=2)
+
+}
+
+if (metric=="Euclidean"){
+  A=var.model_euclidean(s, e, dmat, range=range)
+  values=seq(0,range-1, 1)
+  newdata=data.frame(dist=values)
+  pred=Predict.matrix(A$sm, newdata) %*% A$p
+  new0 = data.frame(dist=0)
+  pred0 = Predict.matrix(A$sm, new0) %*% A$p
+  pred0 <- pmax(pred0, 0)  # Non-negativity constraint
+  pred = pred/as.vector(pred0)
+  pred <- pmax(pred, 0) # Non-negativity constraint
+  
+  
+
+  plot(values, pred, xlab='Distance (m)', ylab='Covariance', ylim=range(0,1), main = "Covariance Estimation (Euclidean)")
+  lines(values,true.cov(values, rho), col=2)
+  
+  
+  
+  # err = sqrt(mean(pred-true.cov(values, rho))^2)
+  # print(err)
+
+}
+```
+Unified model estimation
+Simultaneously estimates the trend and adjusts for neighbor-based residuals
+INPUT:
+ - formula: GAM regression equation
+ - A: output of var.model_...
+ - w: weights matrix derived from the Cholesky factor of the covariance 
+ - y: the dependent (response) variable vector
+OUTPUT:
+ - A list containing both the standard ridge GAM (RGAM) and Generalized ridge GAM (GRGAM)
+```{r}
+UniqueModel <- function(formula, A, w, y) {
+  # Prepare the dataset by merging spatial structures with the response variable
+  data2=A$data 
+  data2$y=y 
+  # Step 1: Fit a standard Ridge GAM (assumes independent errors)
+  model0=gam(formula=formula, data=data2)  # ridge gam
+  # Step 2: Fit the Generalized Ridge GAM (GRGAM) using the 'magic' algorithm
+  # This incorporates the non-identity covariance structure through weights 'w'
+  model1=gam.magic(model0, w, data=data2) # generalized ridge gam
+  # Store both models in a list for comparison and inference
+  models <- list(model0 = model0, model1 = model1)
+  return(models)
+}
+```
+# GAM Estimation under known covariance to compare Ridge (RGAM) vs Generalized Ridge (GRGAM)
+
+```{r}
+# Higher level of smoothing control with k1, k2 parameters.
+k1=k2=6
+## Fitting models
+if (metric=="Euclidean"){
+  dataf=data.frame(s,y)
+  colnames(dataf) <- c("s1", "s2", "y")
+  s1 <- dataf[,1]
+  s2 <- dataf[,2]
+  # b: Standard Ridge GAM (assumes identity covariance matrix)
+  b <- gam(y ~ s(s1,k=k1)+ s(s2,k=k2), data=dataf) 
+  # b2: Generalized Ridge GAM (incorporates known weights 'w')
+  b2=gam.magic(b, w, data=dataf)
+  } else if (metric=="geodetic"){  # metric is geodetic
+      lon <- points_geo$lon
+      lat <- points_geo$lat
+
+      dataf <- data.frame(lon,lat,y)
+      # Use 'sos' (Splines on the Sphere) for geodetic data to handle spherical geometry    
+      b <- gam(y ~ s(lon,lat, bs="sos", k=k1), data=dataf)
+      b2=gam.magic(b, w, data=dataf)
+  } else{
+  print("Metric should be Euclidean or geodetic")
+}
+## Visualizing Effects and Confidence Intervals
+if (metric == "Euclidean"){
+  ii=order(s[,1])
+  jj=order(s[,2])
+  par(mfrow=c(2,2))
+  
+  # Plot RGAM effects vs True Trend (red line)
+  plot(b, main = expression("RGAM (" * rho == 20 * ")"), select=1, scale=0,shade=TRUE)
+  lines(s[ii,1], f1[ii]-mean(f1), col=2)
+  plot(b, main = expression("RGAM (" * rho == 20 * ")"), select=2,scale=0,shade=TRUE)
+  lines(s[jj,2], f2[jj]-mean(f2), col=2)
+  
+  # Plot GRGAM effects vs True Trend (red line)
+  plot(b2, main = expression("GRGAM (" * rho == 20 * ")"), select=1,scale=0,shade=TRUE)
+  lines(s[ii,1], f1[ii]-mean(f1), col=2)
+  plot(b2, main = expression("GRGAM (" * rho == 20 * ")"), select=2,scale=0,shade=TRUE)
+  lines(s[jj,2], f2[jj]-mean(f2), col=2)
+} else{  # geodetic distance
+  ii <- order(lon)
+  lon_ord <- lon[ii]
+  lat_fixed <- 65 # Reference latitude for 1D effect comparison (change it if you want)
+  newdata <- data.frame(
+  lon = lon_ord,
+  lat = lat_fixed)
+  
+  # Extract predictions and standard errors for both models
+  predrgam <- predict(b, newdata, type="terms", se.fit=TRUE)
+  predgrgam <- predict(b2, newdata, type="terms", se.fit=TRUE)
+
+  fitrgam <- predrgam$fit[,1]
+  sergam  <- predrgam$se.fit[,1]
+  fitgrgam <- predgrgam$fit[,1]
+  segrgam  <- predgrgam$se.fit[,1]
+  f_centered <- f[ii] - mean(f[ii])
+
+  par(mfrow=c(2,2))
+  # 2D Contour Plot for Ridge GAM
+  suppressWarnings(
+  vis.gam(b, view=c("lon","lat"), plot.type="contour", main="Ridge GAM")
+  )
+  # 1D Slice Plot at Latitude 65 for Ridge GAM
+  plot(lon, fitrgam, type="l",
+       xlim = range(lon_ord),
+       ylim = range(fitrgam - 2*sergam, fitrgam + 2*sergam),
+       xlab = "Longitude",
+       ylab = "Effect",
+       main = "Cut at latitude = 65º N")
+  
+  lines(lon_ord, fitrgam + 2*sergam, lty=2) # Upper confidence band
+  lines(lon_ord, fitrgam - 2*sergam, lty=2) # Lower confidence band
+  lines(lon_ord, f_centered, col="red", lwd=2) # Ground truth
+  abline(h=0, lty=3)
+  # 2D Contour Plot for Generalized Ridge GAM
+  suppressWarnings(
+  vis.gam(b2, view=c("lon","lat"), plot.type="contour", main="Generalized ridge GAM")
+  )
+  # 1D Slice Plot at Latitude 65 for Generalized ridge GAM
+  plot(lon, fitgrgam, type="l",
+       xlim = range(lon_ord),
+       ylim = range(c(fitgrgam - 2*segrgam, fitgrgam + 2*segrgam, f_centered)),
+       xlab = "Longitude",
+       ylab = "Effect",
+       main = "Cut at latitude = 65ºN")
+  
+  lines(lon, fitgrgam + 2*segrgam, lty=2)
+  lines(lon, fitgrgam - 2*segrgam, lty=2)
+  lines(lon, f_centered, col="red", lwd=2)
+  abline(h=0, lty=3)
+  
+}
+
+```
+Iterative estimation of trend and covariance components
+This loop refines the model by updating the weights (w)
+BIC can be used to estimate the adequate value of the number of bases k1=k2
+
+```{r}
+# Initialize weights as an Identity matrix (Standard Ridge assumption)
+k1 = k2 = 6
+# w <- diag(rep(1, n))
+max_iter <- 10
+bic0 = bic1 <- numeric(max_iter)  # Initialize BIC values
+models_list <- list()
+
+if (metric=="Euclidean"){
+  ## GAM ignoring correlation (RGAM)
+  dataf <- data.frame(s,y)
+  colnames(dataf) <- c("s1", "s2", "y")
+  s1 <- dataf[,1]
+  s2 <- dataf[,2]
+  b <- gam(y ~ s(s1,k=k1)+ s(s2,k=k2), data=dataf)
+  y <- as.vector(y)
+  residuals=y-predict(b) # Initial residuals
+  
+  for (irep in 1:max_iter) {
+    # Increase spline complexity (basis functions) in each iteration
+    k1=k1+1
+    k2=k2+1
+   
+    print (paste("Iteration k=",k1))
+    # Estimate the spatial variance structure from current residuals
+    A=var.model_euclidean(s, residuals, dmat, range=range)
+   
+    # Visualize Estimated vs Theoretical Covariance
+    values=seq(0,range,1)
+    newdata=data.frame(dist=values)
+    pred=Predict.matrix(A$sm, newdata) %*% A$p
+    pred <- pmax(pred, 0)  # Non-negativity constraint
+    
+    par(mfrow=c(1,1))
+    plot(values, pred, type = "l", xlab="Distance (m)", ylab="Covariance")
+    lines(values, true.cov (values, rho), col=2, lwd = 2)
+    
+    # Reconstruct the full Covariance Matrix (V)
+    dmat <- as.matrix(dmat)
+
+  for ( i in 1:n) {
+   newx=data.frame(dist=dmat[i,]) 
+    V[i,]=Predict.matrix(A$sm, newx) %*% A$p
+    } # A$sm and A$p were generated from the residuals
+  
+  # Numerical stability: adjust Sigma and compute Cholesky-based weights  
+  diag(V) <- diag(V) + 1e-6   
+  V=adjust.Sigma(V)
+  
+  Cv <- chol(V)  # t(Cv)%*%Cv=V
+  w <- solve(t(Cv))  
+  
+  # Compare standard vs generalized effects in the current step
+  b <- gam(y ~ s(s1,k=k1)+ s(s2,k=k2), data=dataf)
+  b2=gam.magic(b, w, data=dataf)
+
+  # Visualization of trend recovery
+  ii=order(s[,1])
+  jj=order(s[,2])
+  par(mfrow=c(2,2))
+  plot(b, main = expression("RGAM (" * rho == 80 * ")"), select=1, scale=0,shade=TRUE)
+  lines(s[ii,1], f1[ii]-mean(f1), col=2)
+  plot(b, main = expression("RGAM (" * rho == 80 * ")"), select=2,scale=0,shade=TRUE)
+  lines(s[jj,2], f2[jj]-mean(f2), col=2)
+  
+  plot(b2, main = expression("GRGAM (" * rho == 80 * ")"), select=1,scale=0,shade=TRUE)
+  lines(s[ii,1], f1[ii]-mean(f1), col=2)
+  plot(b2, main = expression("GRGAM (" * rho == 80 * ")"), select=2,scale=0,shade=TRUE)
+  lines(s[jj,2], f2[jj]-mean(f2), col=2)
+
+  # Dynamic Formula Construction for the Unified Model
+  formula2=NULL
+  for (j in 1:spam) formula2[j]=paste0("s(","dist",j,",by=y",j,")")
+  formula2=paste(formula2,collapse="+")
+  auxi=paste("s(s1,k=",k1,")+ s(s2,k=",k2,")+")
+  
+  formula2=paste(auxi, formula2)
+  
+  formula2=reformulate(formula2, response ="y")
+  
+  M <- ModelErrors(s, residuals, dmat, spam)
+  
+  models <- UniqueModel(formula2, M, w, y)
+  bic0[irep]=BIC(models$model0)
+  bic1[irep]=BIC(models$model1)
+  residuals_noridge=as.vector(y)-predict(b) 
+  residuals <- y -predict(b)
+
+}
+  par(mfrow=c(1,1))
+  plot(bic1, type = "b", main='BIC evolution (GRGAM)', xlab="Iteration", ylab="BIC")
+  #lines(bic1)
+  argumin <- which.min(bic1)
+  k1 <- k1 - (max_iter - argumin)
+  k2 <- k2 - (max_iter - argumin)
+}
+```
+
+The same operation of the previous chunk but for geodetic distances
+```{r}
+if (metric=="geodetic"){
+## RGAM
+  lon <- points_geo$lon
+  lat <- points_geo$lat
+  dataf <- data.frame(lon, lat, y)
+  colnames(dataf) <- c("lon", "lat", "y")
+  b <- gam(y ~ s(lon,lat, bs="sos", k=k1), data=dataf)
+  residuals=y-predict(b)
+
+  for (irep in 1:max_iter) {
+    k1=k1+1
+    k2=k2+1
+   
+    print (paste("k=",k1))
+    A=var.model_geodetic(points_geo, residuals, dmat, range=range)
+    # 
+    values=seq(0,range-1000, 15000)
+    newdata=data.frame(dist=values)
+    pred=Predict.matrix(A$sm, newdata) %*% A$p
+    pred <- pmax(pred, 0)
+    par(mfrow=c(1,1))
+    plot(values, pred, type = "l", xlab="Distance", ylab="Covariance", main = paste("Covariance Estimation - Iteration", irep))
+    lines(values, true.cov (values, rho), col=2)
+  
+    # Reconstruct the full Geodetic Covariance Matrix (V)  
+    for ( i in 1:n) {
+      newx=data.frame(dist=dmat[i,]) 
+      V[i,]=Predict.matrix(A$sm, newx) %*% A$p
+      } 
+    
+    # Apply numerical stabilization and update weights via Cholesky decomposition
+    diag(V) <- diag(V) + 1e-6   
+    V=adjust.Sigma(V)
+    
+    Cv <- chol(V)  # t(Cv)%*%Cv=V
+    w <- solve(t(Cv))  
+    
+    # Re-fit both standard and generalized models with updated weights
+    b <- gam(y ~ s(lon,lat, bs="sos", k=k1), data=dataf)
+    b2=gam.magic(b, w, data=dataf)
+  
+    # lon <- result$points_geo$lon
+    ii=order(lon)
+    lon_ord <- lon[ii]
+    lat_fijo <- 65
+    
+    newdata <- data.frame(
+      lon = lon_ord,
+      lat = lat_fijo)
+    
+    predrgam <- predict(b, newdata, type="terms", se.fit=TRUE)
+    predgrgam <- predict(b2, newdata, type="terms", se.fit=TRUE)
+
+    fitrgam <- predrgam$fit[,1]
+    sergam  <- predrgam$se.fit[,1]
+    fitgrgam <- predgrgam$fit[,1]
+    segrgam  <- predgrgam$se.fit[,1]
+    f_centered <- f[ii] - mean(f[ii])
+
+    
+    par(mfrow=c(1,2))
+    
+    plot(lon, fitrgam, type="l",
+       xlim = range(lon),
+       ylim = range(fitrgam - 2*sergam, fitrgam + 2*sergam),
+       xlab = "Longitude",
+       ylab = "Effect",
+       main = "Ridge GAM (65ºN)", cex.main = 0.9)
+
+
+    lines(lon_ord, fitrgam + 2*sergam, lty=2)
+    lines(lon_ord, fitrgam - 2*sergam, lty=2)
+    lines(lon_ord, f_centered, col="red", lwd=2)  # Ground truth
+    abline(h=0, lty=3)
+
+    plot(lon, fitgrgam, type="l",
+       xlim = range(lon),
+       ylim = range(c(fitgrgam - 2*segrgam, fitgrgam + 2*segrgam, f_centered)),
+       xlab = "Longitude",
+       ylab = "Effect",
+       main = "Generalized ridge GAM (65ºN)",
+       cex.main = 0.9)
+  
+    lines(lon_ord, fitgrgam + 2*segrgam, lty=2)
+    lines(lon_ord, fitgrgam - 2*segrgam, lty=2)
+    lines(lon_ord, f_centered, col="red", lwd=2)
+    abline(h=0, lty=3)
+
+    # Dynamic formula generation for neighbor-based residuals
+    formula2=NULL
+    for (j in 1:spam) formula2[j]=paste0("s(","dist",j,",by=y",j, ",bs='cr'", ")")
+    formula2=paste(formula2,collapse="+")
+    auxi = paste("s(lon, lat, bs='sos', k=",k1, ")+")
+
+    formula2=paste(auxi, formula2)
+    
+    formula2=reformulate(formula2, response ="y")
+    
+    M <- ModelErrors(points_geo, residuals, dmat, spam)
+    
+    models <- UniqueModel(formula2, M, w, y)
+    bic0[irep]=BIC(models$model0)
+    bic1[irep]=BIC(models$model1)
+    residuals_noridge=as.vector(y)-predict(b) 
+    residuals <- y -predict(b)
+  
+  }
+  
+  par(mfrow=c(1,1))
+  plot(bic1, type = "b", main='BIC evolution GRGAM', xlab="Iteration", ylab="BIC")
+  #lines(bic1)
+    argumin <- which.min(bic1)
+  k1 <- k1 - (max_iter - argumin)
+  k2 <- k2 - (max_iter - argumin)
+  
+}
+```
+
+Modeling Spatial Residuals and Neighborhood Effects
+This section evaluates how much of the remaining error or the original response 
+can be explained by the values of the nearest neighbors.
+
+```{r}
+if (is.vector(y)=="FALSE"){y <- as.vector(y)}
+
+resid=y-predict(b2, newdata=dataf)
+
+if (metric=="Euclidean"){
+# Model A: Residuals as a function of neighbors' residuals  
+A=ModelErrors(s,resid,dmat, spam)
+# Model B: Original response as a function of neighbors' responses
+B=ModelErrors(s,y,dmat, spam) 
+ } else{  # Geodetic case using spherical coordinates
+A=ModelErrors(points_geo,resid,dmat, spam)
+B=ModelErrors(points_geo,y,dmat, spam)
+ }
+
+# -Analysis of Model A (Residuals Model)
+model_A=A$model
+summary(model_A)
+# Plot the smooth effects of each neighbor's residual
+par(mfrow=c(2,2))
+plot(model_A, pages=1)
+# # Diagnostic plot: Observed Residuals vs Predicted Residuals
+par(mfrow=c(1,1))
+plot(A$data$y~predict(model_A), xlab = "Predicted Residuals", ylab = "Observed Residuals",
+     main = "Residuals Model Fit")
+abline(a=0,b=1, col = "red", lwd = 2)
+
+# Analysis of Model B (Full Response Model) 
+model_B=B$model
+summary(model_B)
+# Plot the smooth effects of each neighbor's value
+par(mfrow=c(2,2))
+plot(model_B, pages=1, , main = "Neighbor Effects on Response")
+# Diagnostic plot: Observed Response vs Predicted Response (Local Model)
+par(mfrow=c(1,1))
+plot(A$data$y~predict(model_B), xlab = "Predicted Response (Local)", ylab = "Observed Response",
+     main = "Neighborhood Response Model Fit")
+abline(a=0,b=1, col = "red", lwd = 2)
+
+```
+--- Unified Model Estimation (RGAM and GRGAM) ---
+This block constructs the full model formula combining spatial trend 
+and neighborhood-based local correlation effects.
+```{r}
+if (metric=="Euclidean"){
+  # Build the neighborhood formula components: s(dist_j, by = y_j)
+  formula=NULL
+  for (j in 1:spam) {formula[j]=paste0("s(","dist",j,",by=y",j,")")}
+  formula=paste(formula,collapse="+")
+  # Combine trend (s1, s2) with neighborhood effects
+  formula=paste("s(s1)+s(s2)+", formula)
+  formula=reformulate(formula, response ="y")
+  
+  # Fit both Ridge GAM and Generalized Ridge GAM
+  models <- UniqueModel(formula, A, w, y)
+  model0 <- models$model0  # Ridge GAM
+  model1 <- models$model1  # Generalized Ridge GAM
+  # Generate predictions and calculate residuals
+  yhat0 <- predict(model0, data=data)
+  resd0 <- y -yhat0
+  yhat1 <- predict(model1, data=data)
+  resd1 <- y - yhat1
+  
+  # Visual comparison of model fits
+  par(mfrow=c(1,2))
+  plot(y~yhat0, main = "RGAM Fit (Euclidean)", xlab = "Predicted", ylab = "Observed" )
+  abline(a=0,b=1, col = "red", lwd = 2) # Identity line
+  plot(y~yhat1, main = "GRGAM Fit (Euclidean)", xlab = "Predicted", ylab = "Observed")
+  abline(a=0,b=1, col = "red", lwd = 2)
+} else {  # Geodetic case: Build formula using Splines on the Sphere (sos)
+  formula=NULL  
+  for (j in 1:spam) formula[j]=paste0("s(","dist",j,",by=y",j, ",bs='cr'", ")")
+  formula=paste(formula,collapse="+")
+  formula=paste("s(lon, lat, bs='sos')+", formula)
+  formula=reformulate(formula, response ="y")
+  
+  models <- UniqueModel(formula, A, w, y)
+  model0 <- models$model0  # Ridge GAM
+  model1 <- models$model1  # Generalized Ridge gam
+  yhat0 <- predict(model0, data=data)
+  resd0 <- y -yhat0
+  yhat1 <- predict(model1, data=data)
+  resd1 <- y - yhat1
+  
+  par(mfrow=c(1,2))
+  plot(y~yhat0, main="RGAM Fit (Geodetic)", xlab = "Predicted", ylab = "Observed")
+  abline(a = 0, b = 1, col = "red", lwd = 2)
+  plot(y~yhat1, main="GRGAM Fit (Geodetic)", xlab = "Predicted", ylab = "Observed")
+  abline(a = 0, b = 1, col = "red", lwd = 2)
+}
+```
+Spatial Autocorrelation Analysis (Moran's I) 
+This block tests whether the residuals of the models still exhibit 
+spatial patterns or if they have been successfully reduced to white noise.
+
+```{r}
+if (metric=="Euclidean"){
+  # Define spatial neighbors based on a fixed distance radius (Adjust d2 if needed)
+  coords <- cbind(s[,1], s[,2])
+  nb <- dnearneigh(coords, d1 = 0, d2 = 60) 
+  # Convert neighbor list to a row-standardized weight matrix
+  lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+  # Ensure residuals are in vector format for the test
+  resi0v <- as.vector(resd0)
+  resi1v <- as.vector(resd1)
+  # lisa <- localmoran(resiv, lw)
+  # summary(lisa)
+  # plot(lisa[,1])
+  # Perform Moran's I test for both models
+  im0 <- moran.test(resi0v, lw) # Standard Ridge GAM
+  im1 <- moran.test(resi1v, lw) # Generalized Ridge GAM
+  
+  cat('Moran Index - Ridge GAM:', im0$estimate[1], 'p-value', im0$p.value,'\n')
+  cat('Moran Index - Gen. Ridge GAM:', im1$estimate[1], 'p-value', im1$p.value,'\n')
+} else  { # Geodetic case using Longitude and Latitude coordinates
+  coords <- cbind(lon, lat)
+  # Define neighbor radius for spherical data (Adjust d2 as necessary)
+  nb <- dnearneigh(coords, d1 = 0, d2 = 10000) 
+  lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+  resi0v <- as.vector(resd0)
+  resi1v <- as.vector(resd1)
+  # lisa <- localmoran(resiv, lw)
+  # summary(lisa)
+  # plot(lisa[,1])
+  im0 <- moran.test(resi0v, lw)
+  im1 <- moran.test(resi1v, lw)
+  
+  cat('Moran Index - Ridge GAM:', im0$estimate[1], 'p-value', im0$p.value,'\n')
+  cat('Moran Index - Generalized Ridge GAM:', im1$estimate[1], 'p-value', im1$p.value,'\n') 
+  
+}
+
+```
+# Spatial correlation analysis via semivariogram
+# This block uses classical geostatistics to evaluate the spatial structure 
+# of the residuals and verify if any spatial dependency remains.
+```{r}
+# Create a spatial object
+datos_sp <- data.frame(resi0v)
+
+coordinates(datos_sp) <- coords
+# Compute the Empirical Variogram
+timevariog <- microbenchmark(
+  pipeline = {
+variograma_empirico <- variogram(datos_sp@data$resi0v~datos_sp@coords[,1]+datos_sp@coords[,2],data=datos_sp)
+# Plot the raw empirical variogram
+# plot(variograma_empirico, main = "Empirical Variogram of Residuals")
+# Automatic Variogram Model Fitting
+# Fits the best theoretical model among Spherical (Sph), Exponential (Exp), 
+# and Gaussian (Gau) using weighted least squares.
+# modelo_variograma_ajustado <- fit.variogram(variograma_empirico, model = vgm(c("Sph", "Exp", "Gau")))
+modelo_variograma_ajustado <- fit.variogram(variograma_empirico, model = vgm("Sph"))
+},
+times = 100
+)
+median_ms <- summary(timevariog)$median
+cat("Median execution time:", median_ms, "ns\n")
+# Overlay the fitted theoretical model onto the empirical points
+plot(variograma_empirico, modelo_variograma_ajustado, main = "Empirical Variogram and Fitted Model (GAM Residuals)")
+
+```
+## Estimate computational time to create a semivariogram
+```{r}
+# n <- 5000
+# coords <- cbind(s1=runif(n,0,100),s2=runif(n,0,100))
+# resim <- runif(n,-1,1)
+# datos_sp <- data.frame(resim)
+# coordinates(datos_sp) <- coords
+# datos_sp$coords[1]
+# # Compute the Empirical Variogram
+# timevariog <- microbenchmark(
+#   pipeline = {
+# variograma_empirico <- variogram(datos_sp@data$resim~datos_sp@coords[,1]+datos_sp@coords[,2],data=datos_sp)
+# modelo_variograma_ajustado <- suppressWarnings(fit.variogram(variograma_empirico, model = vgm("Sph")))
+# },
+# times = 100
+# )
+# median_ms <- summary(timevariog)$median
+# cat("Median execution time:", median_ms, "ns\n")
+# # Overlay the fitted theoretical model onto the empirical points
+# plot(variograma_empirico, modelo_variograma_ajustado, main = "Empirical Variogram and Fitted Model (GAM Residuals)")
+```
+
+# Spatial Correlation Analysis for Generalized Ridge GAM (GRGAM) 
+# This block examines the residuals of the final generalized model to 
+# ensure that all spatial dependency has been accounted for.
+
+```{r}
+# Create a Spatial Object for GRGAM residuals
+datos_sp <- data.frame(resi1v)
+coordinates(datos_sp) <- coords
+datos_sp$coords[1]
+# Compute the Empirical Variogram for GRGAM residuals
+variograma_empirico <- variogram(datos_sp@data$resi1v~datos_sp@coords[,1]+datos_sp@coords[,2],data=datos_sp)
+# Plot the empirical variogram
+plot(variograma_empirico, main = "Empirical Variogram (GRGAM Residuals)")
+# Fit a Theoretical Variogram Model
+modelo_variograma_ajustado <- fit.variogram(variograma_empirico, model = vgm(c("Sph", "Exp", "Gau")))
+# Final Diagnostic Visualization
+plot(variograma_empirico, modelo_variograma_ajustado, main = "Empirical Variogram and Fitted Model (GRGAM residuals)")
+```
+
+# Final Model Inference 
+# Estimating the response variable 'y' by combining spatial coordinates 
+# and localized information from the nearest neighbors
+
+```{r}
+data2=A$data
+if (metric=="geodetic"){
+  names(data2)[names(data2)=="s1"] <- "lon"
+  names(data2)[names(data2)=="s2"] <- "lat"
+}
+# Substitute the simulated error with the actual response variable 'y'
+data2$y=y  
+# Fit the models: model0 (Standard Ridge) and model1 (Generalized with magic algorithm)
+model0=gam(formula=formula, data=data2)  
+model1=gam.magic(model0, w, data=data2) 
+
+# --- Visualization for Euclidean Metric ---
+if (metric=="Euclidean"){
+  par(mfrow=c(2,2))
+  # Plot Trend Effects (s1 and s2 components)
+  plot(model0, main = "RGAM: spatial trend", select=1,scale=0, shade=TRUE)
+  lines(s[ii,1], f1[ii]-mean(f1), col=2) # ground truth
+  plot(model0, main = "RGAM: Spatial Trend", select=2,scale=0,shade=TRUE)
+  lines(s[jj,2], f2[jj]-mean(f2), col=2)
+  
+  plot(model1, main = "GRGAM: Spatial Trend", select=1,scale=0,shade=TRUE)
+  lines(s[ii,1], f1[ii]-mean(f1), col=2)
+  plot(model1, main = "GRGAM: Spatial Trend", select=2,scale=0,shade=TRUE)
+  lines(s[jj,2], f2[jj]-mean(f2), col=2)
+  
+  # Plot Neighborhood Effects (Local components)
+  par(mfrow=c(2,2))
+  plot(model0, main = "RGAM: Neighbor 1", select=3,scale=0,shade=TRUE)
+  plot(model0, main = "RGAM: Neighbor 2", select=4,scale=0,shade=TRUE)
+  plot(model1, main = "GRGAM: Neighbor 1", select=3,scale=0,shade=TRUE)
+  plot(model1, main = "GRGAM: Neighbor 1", select=4,scale=0,shade=TRUE)
+  
+  summary(model0)
+} else {  # geodetic distance
+  # Plot Spherical Trend Recovery (SOS splines)
+  par(mfrow=c(1,2))
+  plot(model0, main = "GRGAM: Geodetic Trend", select=2,scale=0, shade=TRUE)
+  lines(lon[ii], f[ii]-mean(f[ii]), col=2)
+
+  plot(model1, main = "GRGAM: Geodetic Trend", select=2,scale=0,shade=TRUE)
+  lines(lon[ii], f[ii]-mean(f), col=2)
+
+  
+  # Plot Nearest Neighbor effects for Geodetic data
+  par(mfrow=c(1,2))
+  plot(model0, main = "RGAM: Neighbor Effect", select=3,scale=0,shade=TRUE)
+  plot(model1, main = "GRGAM: Neighbor Effect", select=3,scale=0,shade=TRUE)
+
+  
+  summary(model1)
+}
+```
+
+# Graphical comparison of Model Performance
+# Comparing the fitted values of RGAM vs GRGAM to evaluate the 
+# contribution of global trends and local neighborhood effects
+
+```{r}
+if (metric=="Euclidean"){
+  par(mfcol=c(2,2))
+  # Full Model Comparison (Trend + Neighbors)
+  plot(data2$y, predict(model0), main="Complete RGAM", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1, col = 2, lwd = 2)
+  plot(data2$y, predict(model1), main="Complete GRGAM", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1)
+  
+  # Trend-Only Comparison
+  # Neutralize neighborhood effects by setting neighbor distances and values to zero
+  newdata=data2; newdata[,1:(2*spam)]=0  
+  # Predict using ONLY spatial coordinates (s1, s2)
+  pred0=predict(model0, newdata=newdata)
+  plot(data2$y, pred0, main="Only trend RGAM", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1,col=2, lwd = 2)
+  pred1=predict(model1, newdata=newdata)
+  plot(data2$y, pred1, main="Only trend GRGAM", , xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1,col=2, lwd = 2)
+} else {  # # Geodetic distance 
+  # names(data2)[names(data2)=="s1"] <- "lon"
+  # names(data2)[names(data2)=="s2"] <- "lat"
+  # Full Model Comparison
+  par(mfcol=c(2,2))
+  plot(data2$y, predict(model0), main="Complete RGAM (geodetic)", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1, col=2, lwd = 2)
+  plot(data2$y, predict(model1), main="Complete GRGAM", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1, col=2, lwd = 2)
+  
+  # Trend-Only Comparison
+  newdata=data2
+  newdata[,1:(2*spam)]=0  # without data from the neighbors
+  pred0=predict(model0, newdata=newdata)
+  plot(data2$y, pred0, main="Only trend RGAM (geodetic)", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1,col=2, lwd = 2)
+  pred1=predict(model1, newdata=newdata)
+  plot(data2$y, pred1, main="Only trend GRGAM (geodetic", xlab = "Observed", ylab = "Predicted")
+  abline(a=0,b=1, col=2, lwd = 2)
+}
+```
+# Local Indicators of spatial sssociation (LISA) for RGAM
+# This block identifies specific geographic areas where residuals 
+# may still be clustered, providing a localized diagnostic of the model
+
+```{r}
+# Extract residuals from the model
+pred <- predict(model0, data=data2)
+resi <- data2$y - as.vector(pred)  # data2$y is y because we changed it before
+if (metric=="Euclidean") {dmax <- 80
+} else {dmax <- 15000}
+nb <- dnearneigh(coords, d1 = 0, d2 = dmax) # change d2 if distance is Euclidean
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+resiv <- as.vector(resi)
+# Compute Local Moran's I (LISA)
+# This estimates spatial autocorrelation for each individual point.
+lisa <- localmoran(resiv, lw)
+summary(lisa)
+
+# Diagnostic Plots
+# Plotting the local Moran coefficients helps identify 'hotspots' or 'outliers'
+par(mfrow = c(1,1))
+plot(lisa[,1], main = "Local Moran's I Coefficients", 
+     xlab = "Index", ylab = "Local I", pch = 19, col = "steelblue")
+abline(h = 0, lty = 2, col = "red")
+
+# Global Moran's Test for Final Confirmation
+moran.test(resi, lw)
+```
+
+# Local Indicators of spatial sssociation (LISA) for GRGAM
+# This block identifies specific geographic areas where residuals 
+# may still be clustered, providing a localized diagnostic of the model
+
+```{r}
+# Extract residuals from the model
+pred <- predict(model1, data=data2)
+resi <- data2$y - as.vector(pred)  # data2$y is y because we changed it before
+if (metric=="Euclidean") {dmax <- 80
+} else {dmax <- 15000}
+nb <- dnearneigh(coords, d1 = 0, d2 = dmax) # change d2 if distance is Euclidean
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+resiv <- as.vector(resi)
+# Compute Local Moran's I (LISA)
+# This estimates spatial autocorrelation for each individual point.
+lisa <- localmoran(resiv, lw)
+summary(lisa)
+
+# Diagnostic Plots
+# Plotting the local Moran coefficients helps identify 'hotspots' or 'outliers'
+par(mfrow = c(1,1))
+plot(lisa[,1], main = "Local Moran's I Coefficients", 
+     xlab = "Index", ylab = "Local I", pch = 19, col = "steelblue")
+abline(h = 0, lty = 2, col = "red")
+
+# Global Moran's Test for Final Confirmation
+moran.test(resi, lw)
+```
+
+# Final Hybrid Prediction: Trend + Local Correction 
+# This block combines the global spatial trend (b2) with the local 
+# neighborhood residuals (A$model) to produce the final estimate
+
+```{r}
+data2$y <- y # Substitute errors for the response variable
+yhat <- predict(b2, newdata=data2) + predict(A$model, newdata=A$data) 
+resid_combined <- data2$y - yhat
+# Visual Validation
+# Predicted vs Observed values
+par(mfrow=c(1,1))
+plot(data2$y, yhat, main = "Final Hybrid Model Adjustment", 
+     xlab = "Observed Values (y)", ylab = "Hybrid Predictions (y_hat)",
+     pch = 19, col = rgb(0.2, 0.4, 0.6, 0.5))
+abline(a = 0, b = 1, col = "red", lwd = 2)
+
+# Error Quantification (RMSE)
+mse <- mean((yhat-data2$y)^2)
+rmse <- sqrt(mse)
+cat('RMSE:', rmse,'\n')
+data_range <- max(y) - min(y)
+rmse_pct_range <- (rmse / data_range) * 100
+cat("RMSE (%) relative to Data Range:", round(rmse_pct_range, 4), "%\n")
+
+# RMSE relative to the Standard Deviation (Spread)
+data_sd <- sd(y)
+rmse_pct_sd <- (rmse / data_sd) * 100
+cat("RMSE (%) relative to Standard Deviation:", round(rmse_pct_sd, 4), "%\n")
+
+# RMSE relative to the Mean
+data_mean <- mean(y)
+rmse_pct_mean <- (rmse / data_mean) * 100
+cat("RMSE (%) relative to the Mean:", round(rmse_pct_mean, 4))
+```
+
+# Final Diagnostic: Moran's I on Hybrid Residuals
+# This test confirms if the combined model (Trend + Neighborhood Correction) 
+# has successfully neutralized all spatial dependency
+
+```{r}
+# Perform the Moran's I test using the previously defined spatial weights (lw)
+im_combined <- moran.test(resid_combined , lw)
+
+# Output the results for the final report
+cat('--- Final Spatial Diagnostic ---\n')
+cat('Observed Moran I:', round(im_combined$estimate[1], 5), '\n')
+cat('Expected Moran I:', round(im_combined$estimate[2], 5), '\n')
+cat('P-value:', im_combined$p.value, '\n')
+
+# Quick interpretation logic
+if (im_combined$p.value > 0.05) {
+  cat("Conclusion: No significant spatial autocorrelation remains. The model is well-specified.\n")
+} else {
+  cat("Conclusion: Warning! Residual spatial patterns detected. Consider increasing model complexity.\n")
+}
+```
+
+# Function for Ordinary and Universal Kriging Comparison 
+# This function applies classical geostatistical interpolation to a test set
+# to benchmark the performance of the Hybrid GAM model
+
+```{r}
+krigRes <- function(train, test, vgm_model, spam) {
+# Step 1: Prepare Data Frames
+# Ensure training and testing sets have consistent coordinate and response naming
+train_data <- data.frame(s1 = train$s1, s2 = train$s2, value = train$y)
+test_data <- data.frame(s1 = test$s1, s2 = test$s2, value = test$y)
+
+#print(head(test_data))
+
+# Convert to Spatial Objects
+# The 'gstat' library requires objects of class 'SpatialPointsDataFrame'
+coordinates(train_data) <- ~s1 + s2
+coordinates(test_data) <- ~s1 + s2
+# Ordinary Kriging (OK)
+
+  kr <- krige(
+    formula = value ~ 1,
+    locations = train_data,
+    newdata = test_data,
+    model = vgm_model,
+    nmax = spam
+  )
+  
+
+# Universal Kriging (UK)
+# Incorporates a first-order polynomial trend (s1 + s2) 
+# This is the classical competitor to the GAM-based approach.  
+  KrUniv <- krige(
+    formula = value ~ s1 + s2, 
+    #formula = value ~ s1 + s2 + I(s1^2) + I(s2^2) + I(s1*s2),
+    locations = train_data,
+    newdata = test_data,
+    model = vgm_model, 
+    nmax = spam
+    )
+  
+
+return (KrUniv)
+}
+```
+
+# --- Monte Carlo Cross-Validation  ---
+# This loop evaluates the predictive power of the proposed Ridge-GAM 
+# against Universal Kriging (UK) across multiple random data splits.
+
+```{r}
+set.seed(132)
+nrep <- 30 # Number of random split iterations
+RMSERR = RMSE = RMSEKO = RMSEKU = RMSETOT = RMSERRCOMB = numeric(nrep)
+
+df_train_test <- function(datos, porcentaje){
+  n_filas_total <- nrow(datos)
+  n_train <- round(n_filas_total * porcentaje/100)
+  indices_train <- sample(n_filas_total, n_train)
+  df_train <- datos[indices_train, ]
+  indices_test <- setdiff(1:n_filas_total, indices_train)
+  df_test <- datos[indices_test, ]
+  return (list(df_train, df_test, indices_train, indices_test))
+}
+
+# Step 1: Data Partitioning
+# Split into 90% Training and 10% Testing
+for (irep in 1:nrep){
+  dtraintest <- df_train_test(dataf, 90)
+  datostrain <- dtraintest[[1]]  
+  datostest <- dtraintest[[2]]
+  
+  # Extract indices and coordinates
+  indextrain <- as.numeric(row.names(datostrain))  # también dtraintest[[3]]
+  indextest <- as.numeric(row.names(datostest))   # también dtraintest[[4]]
+  strain <- cbind(datostrain[, 's1', drop=FALSE], datostrain[, 's2', drop=FALSE])  # drop=FALSE keeps the names of the rows 
+  
+# Step 2: Neighborhood Mapping for Test Set
+# For each test point, find its nearest neighbors from the training set  
+  test_inferencia <- NULL
+  indices_train_close_test <- list()  # almacena índices de puntos train próximos a cada punto test
+  i <- 1
+  for (i0 in indextest) {
+    # Find the indices of the 'spam' nearest neighbors in the training pool
+    orden_matrix=order(dmat[indextrain, i0]) [1: spam]
+    ii <- indextrain[orden_matrix]
+    # cat('i0 ',i0,'\n')
+    # cat('ii ',ii, '\n')
+    test_inferencia <- rbind(test_inferencia, c(dmat[ii,i0], y[ii], y[i0],s[i0,1],s[i0,2]))
+    test_inferencia <- data.frame(test_inferencia)
+    names(test_inferencia) <- c(paste0("dist",1:spam), paste0("y",1:spam), "y","s1","s2")
+    indices_train_close_test[[i]] <- ii
+    i <- i+1
+  }
+  rownames(test_inferencia) <- as.character(indextest)
+  
+  train_inferencia <- NULL
+  indices_train_close_train <- list()  # stores indices of train points near each train point
+  i <- 1
+  for (i1 in indextrain) {
+    # cat('i0',i0,'\n')
+    orden_matrix=order(dmat[indextrain,i1]) [2: (1+spam)]  ## relative position in the matrix
+    # cat('orden_matrix',orden_matrix, '\n')
+    ii <- indextrain[orden_matrix]  ## point index
+    # cat('ii',ii, '\n')
+    train_inferencia <- rbind(train_inferencia, c(dmat[ii,i1], y[ii], y[i1],s[i1,1],s[i1,2])) ## Index ii is used because dmat, y and s contain all the data (n in our case) 
+    train_inferencia <- data.frame(train_inferencia)
+    names(train_inferencia) <- c(paste0("dist",1:spam), paste0("y",1:spam), "y","s1","s2")
+    indices_train_close_train[[i]] <- ii  # relative order. The first item in the list would correspond to the index of the first element in `indextrain`
+    i <- i + 1
+  }
+  rownames(train_inferencia) <- as.character(indextrain)  # the row names become the indices of the vertices
+  ytrain_inferencia <- train_inferencia$y
+  ytrain_inferencia <- as.vector(ytrain_inferencia)
+  btrain <- gam(ytrain_inferencia ~ s(s1,k=k1) + s(s2,k=k2), data=train_inferencia)
+  b2train <- gam.magic(btrain, w[indextrain, indextrain], data=train_inferencia)  ## w has dimensions n×n, so you can use indextrain as an index
+  
+  residuos_train <-  ytrain_inferencia-predict(b2train)
+  rownames(residuos_train) <- indextrain 
+  A_train <- ModelErrors(strain, residuos_train, dmat[indextrain,indextrain], spam)  
+  
+  modelo_train=A_train$model  # model with distances to the nearest neighbours and no trend
+  summary(modelo_train)
+  # par(mfrow=c(2,2))
+  # plot(modelo_train, pages=1)
+  
+  # par(mfrow=c(1,1))
+  # plot(A_train$data$y~predict(modelo_train))
+  # abline(a=0,b=1)
+  
+  datos_residuos_train <- A_train$data
+  datos_residuos_train$y <- ytrain_inferencia  # replace errors with values y at the points
+  modelo0_train=gam(formula=formula, data=datos_residuos_train)  # a model in which the output is y, but the data points y1, y2, etc. are residuals. It aims to estimate y based on the residuals from the nearest neighbours, adding the trend (s(s1) + s(s2))
+  modelo1_train=gam.magic(modelo0_train, w[indextrain, indextrain], data =datos_residuos_train) # generalized ridge GAM
+  
+  # par(mfrow=c(2,2))
+  # plot(modelo0_train, main = "Ignoring correlation", select=1,scale=0, shade=TRUE)
+  # points(strain[ii,1], f1[ii]-mean(f1[ii]), col=2)
+  # plot(modelo0_train, main = "Ignoring correlation", select=2,scale=0,shade=TRUE)
+  # points(strain[jj,2], f2[jj]-mean(f2[jj]), col=2)
+  # 
+  # plot(modelo1_train, main = "Known correlation", select=1,scale=0,shade=TRUE)
+  # lines(strain[ii,1], f1[ii]-mean(f1[ii]), col=2)
+  # plot(modelo1_train, main = "Known correlation", select=2,scale=0,shade=TRUE)
+  # points(strain[jj,2], f2[jj]-mean(f2[jj]), col=2)
+  # 
+  # 
+  # par(mfrow=c(2,2))
+  # plot(modelo0_train, main = "Ignoring correlation", select=3,scale=0,shade=TRUE)
+  # plot(modelo0_train, main = "Ignoring correlation", select=4,scale=0,shade=TRUE)
+  # plot(modelo1_train, main = "Known correlation", select=3,scale=0,shade=TRUE)
+  # plot(modelo1_train, main = "Known correlation", select=4,scale=0,shade=TRUE)
+  
+  #summary(modelo0_train)
+  # summary(modelo1_train)  # modelo ridge
+  
+  # par(mfcol=c(1,2))
+  # plot(datos_residuos_train$y, predict(modelo0_train),main="Modelo Completo");abline(a=0,b=1, col=2)
+  #plot(datos2$y, predict(modelo1)); abline(a=0,b=1)
+  
+  newdata_train=datos_residuos_train; newdata_train[,1:2*spam]=0  # don't provide the neighbours' details
+  
+  pred_train=predict(modelo0_train, newdata=newdata_train)
+  # plot(datos_residuos_train$y, pred_train, main="Only trend");abline(a=0,b=1,col=2)
+  
+  pred_train <- predict(modelo0_train, data=train_inferencia)
+  resi_train <- datos_residuos_train$y - as.vector(pred_train)  # Remember that datos_residuos_train$y is y
+  coords_train <- strain
+
+  
+  matrix_train_close_test <- do.call(rbind, indices_train_close_test)  # row names are relative
+  matrix_train_close_train <- do.call(rbind, indices_train_close_train)  # lrow names are relative
+  test_inferencia_residuos <- test_inferencia  # A copy of the test_inferencia in which the values of y must be replaced with residuals
+  
+  
+  for (i in 1:dim(test_inferencia)[1]){
+    itest <- indextest[i]  # not used
+    for (j in 1:spam){
+      itrain <- matrix_train_close_test[i,j]  # neighbour of train a test
+      residuo <- residuos_train[as.character(itrain)]  
+      test_inferencia_residuos[i,spam+j] <- residuo
+    }
+  }
+  
+  ## RMSE UNIFIED RGAM
+  pred_test_inferencia <- predict(modelo0_train, newdata=test_inferencia_residuos)
+  error_test_inferencia <- pred_test_inferencia - test_inferencia$y
+  # plot(pred_test_inferencia, test_inferencia$y)
+  # abline(a=0,b=1)
+  rmse_inferencia = sqrt(mean(error_test_inferencia^2))
+  
+  ## RMSE UNIFIED GRGAM
+  pred_test_inferencia_RR <- predict(modelo1_train, newdata=test_inferencia_residuos)
+  error_test_inferencia_RR <- pred_test_inferencia_RR - test_inferencia$y
+  # plot(pred_test_inferencia_RR, test_inferencia$y)
+  # abline(a=0,b=1)
+  rmse_inferencia_RR = sqrt(mean(error_test_inferencia_RR^2))
+  
+  ## RMSE TREND + RESIDUALS
+  pred_test_inferencia_trend <- predict(b2train, newdata=datostest)
+  yhat_model_comb <- pred_test_inferencia_trend + predict(A_train$model, newdata=test_inferencia_residuos)
+  err_test_inferencia_RRcom <- as.vector(yhat_model_comb) - test_inferencia$y
+  # plot(yhat_model_comb, test_inferencia$y)
+  # abline(a=0,b=1)
+  rmse_inferencia_RRcom = sqrt(mean(err_test_inferencia_RRcom^2))
+ 
+  RMSE[irep] <- rmse_inferencia
+  RMSERR[irep] <- rmse_inferencia_RR
+  RMSERRCOMB[irep] <- rmse_inferencia_RRcom
+  
+  ## Krigeado
+  
+  ## Create a gstat object
+  s1 <- datostrain$s1
+  s2 <- datostrain$s2
+  coordinates(datostrain) <- ~s1 + s2
+  # gkor <- gstat(formula = y ~ 1, data = datostrain)
+      # gkun <- gstat(formula = y ~ s1 + s2, data = traint)
+  gkun <- gstat(formula = y ~ s1 + s2 , data = datostrain)
+      
+  # emp_variogram_kor <- variogram(gkor)
+  emp_variogram_kun <- variogram(gkun)
+      
+
+  vgm_model_fit_un <- autofitVariogram(
+        formula = y ~ s1 + s2,
+        input_data = datostrain
+  )
+      
+
+      
+  KrU <- krigRes(datostrain, datostest, vgm_model_fit_un$var_model, spam)  # [[2]]
+  
+  # par(mfcol=c(1,2))
+  # 
+  # par(mfrow=c(1,2))
+  # plot(pred_test_inferencia, test_inferencia$y)
+  # abline(a=0,b=1)
+  # plot(KrU$var1.pred, test_inferencia$y)
+  # abline(a=0,b=1)
+  
+
+  RMSEKU[irep] = sqrt(mean((datostest$y-KrU$var1.pred)^2))
+
+}
+
+  
+par(mfcol=c(1,1))  
+boxplot(cbind(RMSE, RMSERRCOMB, RMSEKU), names = c('RGAM', 'GRGAM', 'UKr'), ylab='RMSE', outline=TRUE)
+```
+# Application to real data
+## Load the file with the data
+## https://www.aspexit.com/linear-modelling-of-spatial-data-in-r/
+
+```{r}
+data(meuse)
+meuse <- st_as_sf(meuse, coords=c('x','y'), remove=FALSE)
+summary(meuse)
+st_geometry(meuse)=NULL
+```
+Create a dataframe with columns s1,s2,y
+
+```{r}
+datos <- data.frame(s1=meuse$x, s2=meuse$y, y=meuse$lead, dist=meuse$dist)
+s <- cbind(datos$s1, datos$s2)
+```
+
+# Represent data for Pb
+```{r}
+library(ggplot2)
+library(ggspatial)
+# y <- as.vector(datos$y)
+# s1 <- datos$s1
+# s2 <- datos$s2
+ggplot(datos, aes(x = s1, y = s2, color = y)) +
+  geom_point() +
+  scale_color_gradient2(name = waiver(), low = "blue", mid = "yellow", high = "red",
+                        midpoint = 300) +
+  labs(title = "",
+        x = expression(s[1]),
+        y = expression(s[2]),
+       color = "Pb (ppm)") +
+  theme_minimal() +
+    annotation_north_arrow(
+    location = "tl",          # esquina top-right
+    which_north = "true",     # norte verdadero
+    style = north_arrow_fancy_orienteering
+  )
+```
+
+Build de distance matrix
+
+```{r}
+distancias <- dist(s)
+dmatrix <- as.matrix(distancias)
+```
+
+Residuals covariance
+
+```{r}
+rango <- 3000
+y <- as.vector(datos$y)
+A <- var.model_euclidean(s, y, dmatrix, range=rango)
+values <- seq(0,rango-1,1)
+newdata <- data.frame(dist=values)
+pred <- Predict.matrix(A$sm, newdata) %*% A$p
+new0 <- data.frame(dist=0)
+pred0 <- Predict.matrix(A$sm, new0) %*% A$p
+pred <- pred/as.vector(pred0)
+pred <- pmax(pred, 0)
+
+# pdf_path <- paste(dir,'figuras', 'variance_scenario2.pdf',sep='/')
+# pdf(pdf_path)
+plot(values,pred,xlab='Distance', ylab='Covariance')
+# dev.off()
+```
+RGAM and GRGAM
+
+```{r}
+k1 = k2 = 6
+n <- nrow(datos)
+
+V <- matrix(0, nrow=n, ncol=n)
+for (i in 1:n){
+  newx=data.frame(dist=dmatrix[i,])
+  V[i,] = Predict.matrix(A$sm, newx) %*% A$p}
+V <- V/as.vector(pred0)
+
+diag(V) <- diag(V) + 1e-6
+V=(V)
+
+Cv <- chol(V) 
+
+w <- solve(t(Cv)) 
+
+b <- gam(y ~ s(s1, s2, k = k1), data=datos)  # datos contains the data s1, s2, and original
+b2=gam.magic(b, w, data=datos)   # W calculated using the Cholesky decomposition of the covariance matrix V
+
+par(mfrow=c(1,2))
+# plot(b, main = "GAM", scale=0,shade=TRUE)
+#plot(b2, main = "Ridge GAM", scale=0,shade=TRUE)
+vis.gam(b, main = "Ridge GAM", view = c("s1", "s2"), plot.type = "contour", color = "topo")
+vis.gam(b2, main = "Generalized ridge GAM", view = c("s1", "s2"), plot.type = "contour", color = "topo")
+
+```
+RGAM and GRGAM iterating
+
+```{r}
+k1 = k2 = 6
+b <- gam(y ~ s(s1,k=k1)+ s(s2,k=k2), data=datos)
+residuos=y-predict(b)
+max_iter <- 10
+bic0 = bic1 <- numeric(max_iter)  # Initialize BIC values
+models_list <- list()
+newx0 = data.frame(dist=0)
+
+# dataf=data.frame(s,y)
+# colnames(dataf) <- c("s1", "s2", "y")
+# s1 <- dataf[,1]
+# s2 <- dataf[,2]
+# residuals=y-predict(b)
+for (irep in 1:max_iter) {
+    # Increase spline complexity (basis functions) in each iteration
+    k1=k1+1
+    k2=k2+1
+   
+    print (paste("Iteration k=",k1))
+    # Estimate the spatial variance structure from current residuals
+    A=var.model_euclidean(s, residuos, dmatrix, range=rango)
+   
+    # Visualize Estimated vs Theoretical Covariance
+    values=seq(0,rango,1)
+    newdata=data.frame(dist=values)
+    pred=Predict.matrix(A$sm, newdata) %*% A$p
+    new0 = data.frame(dist=0)
+    pred0 = Predict.matrix(A$sm, new0) %*% A$p
+    pred0 <- pmax(pred0, 0)  # Non-negativity constraint
+    pred = pred/as.vector(pred0)
+    pred <- pmax(pred, 0)  # Non-negativity constraint
+
+    par(mfrow=c(1,1))
+    plot(values, pred, type = "l", xlab="Distance (m)", ylab="Covariance")
+
+  for ( i in 1:n) {
+   newx=data.frame(dist=dmatrix[i,]) 
+    V[i,]=Predict.matrix(A$sm, newx) %*% A$p
+    } # A$sm and A$p were generated from the residuals
+  
+  # Numerical stability: adjust Sigma and compute Cholesky-based weights  
+  V <- V/as.vector(pred0)
+  diag(V) <- diag(V) + 1e-6   
+  V=adjust.Sigma(V)
+  
+  Cv <- chol(V)  # t(Cv)%*%Cv=V
+  w <- solve(t(Cv))  
+  
+  # Compare standard vs generalized effects in the current step
+  b <- gam(y ~ s(s1,k=k1)+ s(s2,k=k2), data=datos)
+  b2=gam.magic(b, w, data=datos)
+
+  # Visualization of trend recovery
+  par(mfrow=c(2,2))
+  plot(b, main = "Ridge GAM", select=1, scale=0,shade=TRUE)
+  plot(b, main = "Ridge GAM", select=2,scale=0,shade=TRUE)
+
+  plot(b2, main = "Generalized Ridge GAM", select=1,scale=0,shade=TRUE)
+  plot(b2, main = "Generalized Ridge GAM", select=2,scale=0,shade=TRUE)
+
+  # Dynamic Formula Construction for the Unified Model
+  formula2=NULL
+  for (j in 1:spam) formula2[j]=paste0("s(","dist",j,",by=y",j,")")
+  formula2=paste(formula2,collapse="+")
+  auxi=paste("s(s1,k=",k1,")+ s(s2,k=",k2,")+")
+  
+  formula2=paste(auxi, formula2)
+  
+  formula2=reformulate(formula2, response ="y")
+  
+  M <- ModelErrors(s, residuos, dmatrix, spam)
+  
+  models <- UniqueModel(formula2, M, w, y)
+  bic0[irep]=BIC(models$model0)
+  bic1[irep]=BIC(models$model1)
+  residuals_ridge=as.vector(y)-predict(b) 
+  residuals_gridge <- as.vector(y) -predict(b2)
+
+}
+  par(mfrow=c(1,1))
+  plot(bic1, type = "b", main='BIC evolution (GRGAM)', xlab="Iteration", ylab="BIC")
+  #lines(bic1)
+  argumin <- which.min(bic1)
+  k1 <- k1 - (max_iter - argumin)
+  k2 <- k2 - (max_iter - argumin)
+```
+
+Residuals model
+```{r}
+residuos=y-predict(b2, newdata=datos)
+A=ModelErrors(s,residuos,dmatrix,spam)
+B=ModelErrors(s,y,dmatrix,spam)
+
+modelo=A$model
+summary(modelo)
+par(mfrow=c(2,2))
+plot(modelo, pages=1); summary(modelo)
+
+par(mfrow=c(1,1))
+plot(A$data$y~predict(modelo))
+abline(a=0,b=1)
+```
+
+Unified model (RGAM and GRGAM)
+
+```{r}
+formula=NULL
+for (j in 1:spam) formula[j]=paste0("s(","dist",j,",by=y",j,")")
+formula=paste(formula,collapse="+")
+formula=paste("s(s1)+s(s2)+", formula)
+formula=reformulate(formula, response ="y")
+
+models <- UniqueModel(formula, A, w, y)
+model0 <- models$model0  # gam
+model1 <- models$model1  # ridge gam
+yhat0 <- predict(model0, data=datos)
+resd0 <- y -yhat0
+yhat1 <- predict(model1, data=datos)
+resd1 <- y - yhat1
+```
+
+Effects (additive)
+
+```{r}
+datos2=A$data
+datos2$y=y  # Ojo aquí porque estoy sustituyendo el error por la y del dato
+model0=gam(formula=formula, data=datos2)  # modelo en que la salida es la y, pero los datos de y1, y2, etc. son residuos. Quiere estimar la y a partir de los residuos en los vecinos más próximos 
+model1=gam.magic(model0, w, data=datos2) # modelo errores suavizado
+
+par(mfrow=c(2,2))
+plot(model0, main = "Ignoring correlation", select=1,scale=0, shade=TRUE)
+plot(model0, main = "Ignoring correlation", select=2,scale=0,shade=TRUE)
+
+plot(model1, main = "Known correlation", select=1,scale=0,shade=TRUE)
+plot(model1, main = "Known correlation", select=2,scale=0,shade=TRUE)
+
+
+
+par(mfrow=c(2,2))
+plot(model0, main = "Ignoring correlation", select=3,scale=0,shade=TRUE)
+plot(model0, main = "Ignoring correlation", select=4,scale=0,shade=TRUE)
+plot(model1, main = "Known correlation", select=3,scale=0,shade=TRUE)
+plot(model1, main = "Known correlation", select=4,scale=0,shade=TRUE)
+
+summary(model0)
+```
+
+Comparative analysis in a test sample
+
+```{r}
+set.seed(132)
+nrep <- 30  # number of repetitions
+
+RMSERR = RMSE = RMSEKO = RMSEKU =  RMSETOT = RMSERRCOMB = numeric(nrep)
+
+for (irep in 1:nrep){
+  
+  dtraintest <- df_train_test(datos, 90)  # 90 is the sample size for the training samples
+  datostrain <- as.data.frame(dtraintest[[1]])
+  datostest <- as.data.frame(dtraintest[[2]])
+  
+  indextrain <- as.numeric(row.names(datostrain))  # also dtraintest[[3]]
+  indextest <- as.numeric(row.names(datostest))   # also dtraintest[[4]]
+  strain <- cbind(datostrain[, 's1', drop=FALSE], datostrain[, 's2', drop=FALSE])  # drop=FALSE mantiene los valores de los nombres de las filas
+  
+  test_inferencia <- NULL
+  indices_train_close_test <- list()  # store training point indices nearby each test point
+  i <- 1
+  for (i0 in indextest) {
+    orden_matrix=order(dmatrix[indextrain, i0]) [1: spam]
+    ii <- indextrain[orden_matrix]
+    # cat('i0 ',i0,'\n')
+    # cat('ii ',ii, '\n')
+    test_inferencia <- rbind(test_inferencia, c(dmatrix[ii,i0], y[ii], y[i0],s[i0,1],s[i0,2]))
+    test_inferencia <- data.frame(test_inferencia)
+    names(test_inferencia) <- c(paste0("dist",1:spam), paste0("y",1:spam), "y","s1","s2")
+    indices_train_close_test[[i]] <- ii
+    i <- i+1
+  }
+  rownames(test_inferencia) <- as.character(indextest)
+  
+  train_inferencia <- NULL
+  indices_train_close_train <- list()  # almacena índices de puntos train próximos a cada punto train
+  i <- 1
+  for (i0 in indextrain) {
+    # cat('i0',i0,'\n')
+    orden_matrix=order(dmatrix[indextrain,i0]) [2: (1+spam)]  ## posición relativa en la matriz
+    # cat('orden_matrix',orden_matrix, '\n')
+    ii <- indextrain[orden_matrix]  ## índice del punto
+    # cat('ii',ii, '\n')
+    train_inferencia <- rbind(train_inferencia, c(dmatrix[ii,i0], y[ii], y[i0],s[i0,1],s[i0,2])) ## el índice ii se usa porque dmatrix, y, s, contienen todos los datos (300 en nuestro caso) 
+    train_inferencia <- data.frame(train_inferencia)
+    names(train_inferencia) <- c(paste0("dist",1:spam), paste0("y",1:spam), "y","s1","s2")
+    indices_train_close_train[[i]] <- ii  # orden relativo. El primer elemento de la lista correspondería al índice del primer elemento de indextrain
+    i <- i + 1
+  }
+  rownames(train_inferencia) <- as.character(indextrain)  # names of rows become point indices
+  # if (irep==nrep) {
+  #   pdf_path <- paste(dir,'figuras', 'points_distribution.pdf',sep='/')
+  #   pdf(pdf_path, width = 8, height = 6)
+  #   par(mfrow=c(1,1))
+  #   plot(s2~s1, data=datos2,  type = "n")
+  #   points(s2~s1, data=train_inferencia, col=1,pch=16)
+  # # text(x = train_inferencia$s1,
+  # #      y = train_inferencia$s2,
+  # #      labels = row.names(train_inferencia), # Usa los nombres de las filas como etiquetas
+  # #      pos = 4, # Muestra el texto a la derecha del punto
+  # #      cex = 0.6, # Reduce un poco el tamaño del texto para que no se superpongan
+  # #      col = "blue")
+  # #par(mfrow=c(2,2))
+  #   points(s2~s1, data=test_inferencia, col=2,pch=16)
+  #   # text(x = test_inferencia$s1,
+  #   #    y = test_inferencia$s2,
+  #   #    labels = row.names(test_inferencia), # Usa los nombres de las filas como etiquetas
+  #   #    pos = 4, # Muestra el texto a la derecha del punto
+  #   #    cex = 0.6, # Reduce un poco el tamaño del texto para que no se superpongan
+  #   #    col = "red")
+  #   dev.off()
+  # }
+ 
+  ytrain_inferencia <- train_inferencia$y
+  ytrain_inferencia <- as.vector(ytrain_inferencia)
+  btrain <- gam(ytrain_inferencia ~ s(s1,k=k1) + s(s2,k=k2), data=train_inferencia)
+  b2train <- gam.magic(btrain, w[indextrain, indextrain], data=train_inferencia)  ## w tiene dimensión nxn por eso puede usar indextrain como índice
+  
+  residuos_train <-  ytrain_inferencia-predict(b2train)
+  rownames(residuos_train) <- indextrain 
+  A_train <- ModelErrors(strain,residuos_train,dmatrix[indextrain,indextrain],spam)  ## Modelo para errores y valores errores en vecino
+  
+  model_train=A_train$model  # con distancias a vecinos más próximos y sin tendencia
+  summary(model_train)
+  par(mfrow=c(2,2))
+  plot(model_train, pages=1)
+  
+  par(mfrow=c(1,1))
+  plot(A_train$data$y~predict(model_train))
+  abline(a=0,b=1)
+  
+  datos_residuos_train <- A_train$data
+  datos_residuos_train$y <- ytrain_inferencia  # sustituyo errores por valor y en los puntos
+  model0_train=gam(formula=formula, data=datos_residuos_train)  # modelo en que la salida es la y, pero los datos de y1, y2, etc. son residuos. Quiere estimar la y a partir de los residuos en los vecinos más próximos, sumando la tendencia (s(s1) + s(s2))
+  model1_train=gam.magic(model0_train, w[indextrain, indextrain], data=datos_residuos_train) # modelo errores suavizado
+  
+  par(mfrow=c(2,2))
+  plot(model0_train, main = "RGAM", select=1,scale=0, shade=TRUE)
+  plot(model0_train, main = "RGAM", select=2,scale=0,shade=TRUE)
+
+  plot(model1_train, main = "GRGAM", select=1,scale=0,shade=TRUE)
+  plot(model1_train, main = "GRGAM", select=2,scale=0,shade=TRUE)
+
+  
+  par(mfrow=c(2,2))
+  plot(model0_train, main = "RGAM", select=3,scale=0,shade=TRUE)
+  plot(model0_train, main = "RGAM", select=4,scale=0,shade=TRUE)
+  plot(model1_train, main = "GRGAM", select=3,scale=0,shade=TRUE)
+  plot(model1_train, main = "GRGAM", select=4,scale=0,shade=TRUE)
+  
+  #summary(modelo0_train)
+  summary(model1_train)  # GRGAM
+  
+  par(mfcol=c(1,2))
+  plot(datos_residuos_train$y, predict(model0_train),main="Modelo Completo");abline(a=0,b=1, col=2)
+  #plot(datos2$y, predict(modelo1)); abline(a=0,b=1)
+  
+  newdata_train=datos_residuos_train; newdata_train[,1:2*spam]=0  # no le doy datos de los vecinos
+  
+  pred_train=predict(model0_train, newdata=newdata_train)
+  plot(datos_residuos_train$y, pred_train, main="Sólo tendencia");abline(a=0,b=1,col=2)
+  
+  pred_train <- predict(model0_train, data=train_inferencia)
+  resi_train <- datos_residuos_train$y - as.vector(pred_train)  # recuerda que datos_residuos_train$y es y
+  coords_train <- strain
+  # nb <- dnearneigh(coords_train, d1 = 0, d2 = 40)
+  # lw <- nb2listw(nb, style = "W")
+  # resi_train_vector <- as.vector(resi_train)
+  # lisa <- localmoran(resi_train_vector, lw)
+  # summary(lisa)
+  # plot(lisa[,1])
+  # moran.test(resi_train_vector, lw)
+  
+  matrix_train_close_test <- do.call(rbind, indices_train_close_test)  # los nombres de filas son relativos
+  #rownames(matrix_train_close_test) <- indextest
+  matrix_train_close_train <- do.call(rbind, indices_train_close_train)  # los nombres de filas son relativos
+  #rownames(matrix_train_close_train) <- indextrain
+  test_inferencia_residuos <- test_inferencia  # copia de test_inferencia en la que hay que sustituir valores de yi por residuos
+  
+  
+  for (i in 1:dim(test_inferencia)[1]){
+    itest <- indextest[i]  # no lo uso
+    for (j in 1:spam){
+      itrain <- matrix_train_close_test[i,j]  # vecino de train a test
+      residuo <- residuos_train[as.character(itrain)]  
+      test_inferencia_residuos[i,spam+j] <- residuo
+    }
+  }
+  
+  ## RMSE MODELO UNICO
+  pred_test_inferencia <- predict(model0_train, newdata=test_inferencia_residuos)
+  error_test_inferencia <- pred_test_inferencia - test_inferencia$y
+  plot(pred_test_inferencia, test_inferencia$y)
+  abline(a=0,b=1)
+  rmse_inferencia = sqrt(mean(error_test_inferencia^2))
+  
+  ## RMSE MODELO ÚNICO RIDGE
+  pred_test_inferencia_RR <- predict(model1_train, newdata=test_inferencia_residuos)
+  error_test_inferencia_RR <- pred_test_inferencia_RR - test_inferencia$y
+  plot(pred_test_inferencia_RR, test_inferencia$y)
+  abline(a=0,b=1)
+  rmse_inferencia_RR = sqrt(mean(error_test_inferencia_RR^2))
+  
+  ## RMSE MODELO TENDENCIA MÁS RESIDUOS
+  pred_test_inferencia_trend <- predict(b2train, newdata=datostest)
+  yhat_model_comb <- pred_test_inferencia_trend + predict(A_train$model, newdata=test_inferencia_residuos)
+  err_test_inferencia_RRcom <- as.vector(yhat_model_comb) - test_inferencia$y
+  plot(yhat_model_comb, test_inferencia$y)
+  abline(a=0,b=1)
+  rmse_inferencia_RRcom = sqrt(mean(err_test_inferencia_RRcom^2))
+  
+  # cat('RMSE', rmse_inferencia,'\n')
+  # rango_reales <- max(test_inferencia$y) - min(test_inferencia$y)
+  # rmse_porcentaje_rango <- (rmse_inferencia / rango_reales) * 100
+  # cat("RMSE (%) basado en el rango de los valores reales:", rmse_porcentaje_rango, "%\n")
+  # 
+  # sd_reales <- sd(test_inferencia$y)
+  # rmse_porcentaje_sd <- (rmse_inferencia / sd_reales) * 100
+  # cat("RMSE (%) basado en la desviación estándar de los valores reales:", rmse_porcentaje_sd, "%\n")
+  # 
+  # media_reales <- mean(y)
+  # rmse_porcentaje_media <- (rmse_inferencia / media_reales) * 100
+  # cat("RMSE (%) basado en la media de los valores reales:", rmse_porcentaje_media, "%\n")
+  # 
+  # cat('irep', irep, '\n')
+  RMSE[irep] <- rmse_inferencia
+  RMSERR[irep] <- rmse_inferencia_RR
+  RMSERRCOMB[irep] <- rmse_inferencia_RRcom
+  
+  ## Krigeado
+  
+  ## Creo el objeto gstat
+  s1 <- datostrain$s1
+  s2 <- datostrain$s2
+  coordinates(datostrain) <- ~s1 + s2
+  # gkor <- gstat(formula = y ~ 1, data = datostrain)
+      # gkun <- gstat(formula = y ~ s1 + s2, data = traint)
+  gkun <- gstat(formula = y ~ s1 + s2 , data = datostrain)
+      
+  # emp_variogram_kor <- variogram(gkor)
+  emp_variogram_kun <- variogram(gkun)
+      
+  # vgm_model_fit_kor <- autofitVariogram(
+  #       formula = y~1,
+  #       input_data = datostrain
+  #     )
+      
+      # print(vgm_model_fit_kor$var_model)
+      
+      # vgm_model_fit_un <- autofitVariogram(
+      #   formula = y ~ s1 + s2,
+      #   input_data = traint
+      # )
+      
+  vgm_model_fit_un <- autofitVariogram(
+        formula = y ~ s1 + s2,
+        input_data = datostrain
+  )
+      
+      
+      
+      #print('hola')
+      
+  #Kr <- krigRes(datostrain, datostest, vgm_model_fit_kor$var_model, spam)[[1]]
+      
+      #print('adios')
+      
+  KrU <- krigRes(datostrain, datostest, vgm_model_fit_un$var_model, spam)  # [[2]]
+  
+  par(mfcol=c(1,2))
+  
+  par(mfrow=c(1,2))
+  plot(pred_test_inferencia, test_inferencia$y)
+  abline(a=0,b=1)
+  plot(KrU$var1.pred, test_inferencia$y)
+  abline(a=0,b=1)
+  
+  # RMSEKO[irep] = mean((datostest$y-Kr$var1.pred)**2)
+  RMSEKU[irep] = sqrt(mean((datostest$y-KrU$var1.pred)**2))
+  
+  # modelo2_train=gam(formula=formula, data=train_inferencia)
+  # predtot <- predict(modelo2_train, newdata = test_inferencia)
+  # restot <- predtot - as.vector(test_inferencia$y)
+  # rmse_tot <- sqrt(mean(restot^2))
+  # RMSETOT[irep] <- rmse_tot
+  
+  
+  
+}
+
+  
+par(mfcol=c(1,1))  
+boxplot(cbind(RMSE, RMSERRCOMB, RMSEKU), names = c('RGAM', 'GRGAM', 'UKr'), ylab='RMSE', outline=FALSE)
+```
+
+
+```{r}
+plot(s2~s1, data=datos2,  type = "n")
+points(s2~s1, data=train_inferencia, col=1,pch=16)
+#points(s2~s1, data=test_inferencia, col=2,pch=16)
+text(x = train_inferencia$s1,
+     y = train_inferencia$s2,
+     labels = row.names(train_inferencia), # Usa los nombres de las filas como etiquetas
+     pos = 4, # Muestra el texto a la derecha del punto
+     cex = 0.6, # Reduce un poco el tamaño del texto para que no se superpongan
+     col = "blue")
+```
+
+
